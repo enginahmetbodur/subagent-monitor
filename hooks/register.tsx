@@ -32,6 +32,8 @@ const totals = atom({ plugin: 'subagent-monitor', key: 'totals' } as const, ZERO
 const isOpen = atom({ plugin: 'subagent-monitor', key: 'isOpen' } as const, null)
 const mainModel = atom({ plugin: 'subagent-monitor', key: 'mainModel' } as const, null)
 const view = atom({ plugin: 'subagent-monitor', key: 'view' } as const, LIST_VIEW)
+const autoOpened = atom({ plugin: 'subagent-monitor', key: 'autoOpened' } as const, false)
+const closedByHand = atom({ plugin: 'subagent-monitor', key: 'closedByHand' } as const, false)
 
 type Patch = Partial<Omit<SubagentMonitorAgent, 'touchedAt'>>
 
@@ -228,7 +230,9 @@ async function openPane($: EngineInterface): Promise<void> {
   ensureTicker($)
 }
 
+/** Every caller is the person's own press or command: a typed prompt then leaves the pane closed. */
 async function closePane($: EngineInterface): Promise<void> {
+  await update($, closedByHand, () => true)
   await $.ui.close({ id: PANE })
   await update($, isOpen, () => false)
   await update($, view, () => LIST_VIEW)
@@ -361,11 +365,28 @@ export const register: Register = on => {
   on('ui.close', { id: PANE }, async ($, e, next) => {
     const closed = await next(e)
     await safe(async () => {
+      if (e.origin.kind === 'person') await update($, closedByHand, () => true)
       await update($, isOpen, () => false)
       await update($, view, () => LIST_VIEW)
     }, undefined)
 
     return closed
+  }).catch(($, e, next) => next(e))
+
+  // session.start's open is unasked: below 144 columns (110 once asked) it waits undrawn.
+  // The first prompt the person types is asked, so it seats the pane once; it never
+  // reopens one they closed, and the prompt itself passes through untouched.
+  on('prompt.submit', async ($, e, next) => {
+    // A queued prompt (typed mid-turn) or one from elsewhere is not asked: leave the once for theirs.
+    if (e.origin.kind === 'composer' && e.turnId === undefined) {
+      await safe(async () => {
+        if ((await read($, autoOpened)) || (await read($, closedByHand)) || (await isPaneShown($))) return
+        await update($, autoOpened, () => true)
+        await openPane($)
+      }, undefined)
+    }
+
+    return next(e)
   }).catch(($, e, next) => next(e))
 
   on('agent.spawn', async ($, e, next) => {

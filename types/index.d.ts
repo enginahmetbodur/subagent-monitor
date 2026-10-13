@@ -53,6 +53,10 @@ declare module 'claude-code' {
       totals: SubagentMonitorTotals
       /** Whether the pane is open and drawn; null until the mod first decides (auto-open once). */
       isOpen: boolean | null
+      /** True once a typed prompt opened the waiting (or closed) pane: later prompts never reopen it. */
+      autoOpened: boolean
+      /** True once the person closed the pane by hand this session: prompts then leave it closed. */
+      closedByHand: boolean
       /** The model id the main loop's requests name, to give subagents on it the session's window. */
       mainModel: string | null
       view: SubagentMonitorView

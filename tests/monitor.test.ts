@@ -52,6 +52,7 @@ type World = {
   files?: Record<string, string>
   messages?: Record<string, SessionMessage[] | { deny: string }>
   reads?: number
+  opens?: number
 }
 
 /** The world beneath the plugin: its agent list, a session that cost $1.234, its panes, transcripts. */
@@ -74,6 +75,7 @@ const engine = (on: On, world: World, now = 1_000_000) => {
       : [],
   }))
   on('ui.open', () => {
+    world.opens = (world.opens ?? 0) + 1
     world.isPaneUp = true
     world.isPlaced = world.placeOnOpen ?? true
 
@@ -104,6 +106,8 @@ const engine = (on: On, world: World, now = 1_000_000) => {
     }
   })
   on('turn.complete', () => ({ text: '' }))
+  on('prompt.submit', (_$, e) => ({ text: e.text }))
+  on('session.start', (_$, e) => ({ cwd: e.cwd }))
   on('ui.render', { component: 'AbovePrompt' }, ($, e) => $.ui.resolve(e).Box({}))
   on('session.id', () => ({ value: 's1' }))
   on('session.root', () => ({ value: 'C:\\proj' }))
@@ -513,4 +517,80 @@ test('/subagents toggles the pane; one waiting undrawn counts as closed', async 
   world.placeOnOpen = true
   expect((await $.command.run(RUN)).text).toBe('Subagents pane opened.')
   expect(world.isPlaced).toBe(true)
+})
+
+// ---- The first typed prompt seats the pane -------------------------------------------
+
+/** A prompt the person typed at an idle session: asked, so its open is placed at any width. */
+const typed = (text: string) => ({ text, wait: false, origin: { kind: 'composer' as const } })
+
+test('the first typed prompt seats a pane session.start left undrawn, and passes through unchanged', async ($, on) => {
+  const world: World = { list: [], isPaneUp: false, placeOnOpen: false }
+  engine(on, world)
+  await $.session.start({ cwd: 'C:/proj', surface: 'terminal', isInteractive: true })
+  expect(world.isPaneUp).toBe(true)
+  expect(world.isPlaced).toBe(false)
+  expect(world.opens).toBe(1)
+
+  world.placeOnOpen = true
+  const text = 'Map every endpoint.\n  keep   spacing  '
+  const entered = await $.prompt.submit(typed(text))
+  expect(entered.drop).toBeUndefined()
+  expect('text' in entered && entered.text).toBe(text)
+  expect(world.opens).toBe(2)
+  expect(world.isPlaced).toBe(true)
+})
+
+test('a later prompt never reopens the pane, even when it waits undrawn again', async ($, on) => {
+  const world: World = { list: [], isPaneUp: true, isPlaced: false }
+  engine(on, world)
+  await $.prompt.submit(typed('one'))
+  expect(world.opens).toBe(1)
+
+  // Only the once flag stands between this prompt and another open.
+  world.isPlaced = false
+  const entered = await $.prompt.submit(typed('two'))
+  expect('text' in entered && entered.text).toBe('two')
+  expect(world.opens).toBe(1)
+})
+
+test('a queued prompt or one from elsewhere does not spend the once', async ($, on) => {
+  const world: World = { list: [], isPaneUp: true, isPlaced: false }
+  engine(on, world)
+  await $.prompt.submit({ ...typed('mid-turn'), turnId: 't0' })
+  await $.prompt.submit({ text: 'done', wait: false, origin: { kind: 'task-notification' } })
+  expect(world.opens ?? 0).toBe(0)
+
+  await $.prompt.submit(typed('mine'))
+  expect(world.opens).toBe(1)
+})
+
+test('after the person closes the pane, a prompt leaves it closed', async ($, on) => {
+  // By the command (the band and the pane's own close share its path).
+  const world: World = { list: [], isPaneUp: false }
+  engine(on, world)
+  await $.command.run(RUN)
+  await $.command.run(RUN)
+  expect(world.isPaneUp).toBe(false)
+  const before = world.opens
+  const entered = await $.prompt.submit(typed('hello'))
+  expect('text' in entered && entered.text).toBe('hello')
+  expect(world.opens).toBe(before)
+  expect(world.isPaneUp).toBe(false)
+
+  // The command still toggles it either way.
+  expect((await $.command.run(RUN)).text).toBe('Subagents pane opened.')
+})
+
+test('after a click on the band closes the pane, a prompt leaves it closed', async ($, on) => {
+  const world: World = { list: [], isPaneUp: true, isPlaced: true }
+  engine(on, world)
+  const band = await $.ui.mount({ ...BAND, surface: 'terminal' })
+  await band.press({ key: 'subagents-band' })
+  await band.unmount()
+  expect(world.isPaneUp).toBe(false)
+
+  await $.prompt.submit(typed('hello'))
+  expect(world.opens ?? 0).toBe(0)
+  expect(world.isPaneUp).toBe(false)
 })
