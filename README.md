@@ -2,6 +2,8 @@
 
 A Claude Code mod that adds a live **Subagents** pane and a one-line band above the prompt.
 
+![Subagents pane in the Claude desktop app](docs/pane.png)
+
 - Session total at API prices, total tokens, main thread vs subagent cost split, and an input / output / cache read / cache write breakdown
 - One row per subagent: task, type, status, elapsed time, model, effort, tokens, estimated cost and context fill
 - Click a task title to open a detail view with the prompt, a live activity timeline and the final result
