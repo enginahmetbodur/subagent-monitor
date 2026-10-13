@@ -1,0 +1,13 @@
+{
+  "name": "subagent-monitor",
+  "description": "Live Subagents pane for Claude Code: cost, tokens, model, effort and context per subagent.",
+  "owner": {
+    "name": "enginahmetbodur"
+  },
+  "plugins": [
+    {
+      "name": "subagent-monitor",
+      "source": "./"
+    }
+  ]
+}

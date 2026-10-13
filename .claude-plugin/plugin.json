@@ -1,0 +1,9 @@
+{
+  "name": "subagent-monitor",
+  "version": "0.2.0",
+  "description": "A live Subagents pane and band: session cost at API prices, token breakdown, and each subagent's model, effort, elapsed time, context, tokens and cost, with a click-through detail view.",
+  "author": {
+    "name": "enginahmetbodur"
+  },
+  "types": "./types/index.d.ts"
+}
