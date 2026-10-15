@@ -15,6 +15,7 @@ import type { AgentDetail, TimelineItem } from './detail'
 import { clampLines } from './detail'
 import { effortLevel, filledCells, formatElapsed, formatTokens, formatUsd, modelFamily, modelName } from './format'
 import type { RowState } from './rows'
+import { sections } from './rows'
 import type { Palette, TypeLook } from './theme'
 import {
   DESKTOP,
@@ -74,6 +75,10 @@ export type AgentView = {
   state: RowState
   isLive: boolean
   elapsedMs: number | undefined
+  /** For the list's order: latest start first among the live. */
+  startedAt: number | undefined
+  /** For the list's order: latest end first among the finished. */
+  endedAt: number | undefined
   isApproximate: boolean
   model: string | undefined
   effort: string | undefined
@@ -166,16 +171,19 @@ const fillRow = (
   )
 }
 
-/** The handoff's 1px border line, full width; a line of `─` on the terminal. */
+/**
+ * The handoff's 1px border line, full width; a line of `─` on the terminal.
+ * Keyed on a Box on both surfaces: a Text's key does not reach the drawn tree.
+ */
 const hairline = (k: Kit, key: string) => {
-  const { Text } = k
+  const { Box, Text } = k
 
   return k.Svg ? (
     fillRow(k, key, 1, [{ grow: 1, color: BORDER }])
   ) : (
-    <Text key={key} color="inactive">
-      {'─'.repeat(k.cols)}
-    </Text>
+    <Box key={key}>
+      <Text color="inactive">{'─'.repeat(k.cols)}</Text>
+    </Box>
   )
 }
 
@@ -485,8 +493,66 @@ const row = (k: Kit, agent: AgentView, actions: Actions) => {
   )
 }
 
+/** A section's head row: the uppercase label, and what sits at its right. */
+const listHead = (k: Kit, key: string, name: string, right: unknown) => {
+  const { Box } = k
+
+  return (
+    <Box
+      key={key}
+      flexDirection="row"
+      justifyContent="space-between"
+      paddingX={space(k, 20, 0)}
+      paddingTop={space(k, 12, 1)}
+      paddingBottom={space(k, 4, 0)}
+    >
+      {label(k, name)}
+      {right as never}
+    </Box>
+  )
+}
+
+/** A section's rows; `gapAfter` leaves the 16px (a line on the terminal) above the next section's rule. */
+const listBody = (k: Kit, key: string, gapAfter: boolean, children: unknown) => {
+  const { Box } = k
+
+  return (
+    <Box
+      key={key}
+      flexDirection="column"
+      gap={space(k, 4, 1)}
+      paddingX={space(k, 12, 0)}
+      paddingTop={space(k, 4, 0)}
+      paddingBottom={space(k, 16, gapAfter ? 1 : 0)}
+    >
+      {children as never}
+    </Box>
+  )
+}
+
+/** A muted note in place of a section's rows. */
+const listNote = (k: Kit, key: string, lines: string[]) => {
+  const { Box, Text } = k
+
+  return (
+    <Box key={key} flexDirection="column" paddingX={space(k, 8, 0)} paddingY={space(k, 12, 0)}>
+      {lines.map(line => (
+        <Text key={line} color={k.p.muted}>
+          {line}
+        </Text>
+      ))}
+    </Box>
+  )
+}
+
+/**
+ * The list: the live agents under AGENTS, then, past a rule, the finished ones
+ * under FINISHED (left out when none has finished).
+ */
 export const listPane = (k: Kit, s: SummaryView, agents: AgentView[], actions: Actions): RenderElement => {
   const { Box, Text } = k
+  const { live, finished } = sections(agents)
+  const hasFinished = finished.length > 0
 
   return (
     <Box flexDirection="column">
@@ -494,36 +560,27 @@ export const listPane = (k: Kit, s: SummaryView, agents: AgentView[], actions: A
       {hairline(k, 'rule-header')}
       {summary(k, s)}
       {hairline(k, 'rule-summary')}
-      <Box
-        key="list-head"
-        flexDirection="row"
-        justifyContent="space-between"
-        paddingX={space(k, 20, 0)}
-        paddingTop={space(k, 12, 1)}
-        paddingBottom={space(k, 4, 0)}
-      >
-        {label(k, 'Agents')}
+      {listHead(
+        k,
+        'list-head',
+        'Agents',
         <Text color={k.p.muted}>
           <Text color={k.p.running}>{s.running} running</Text> · {s.done} done
-        </Text>
-      </Box>
-      <Box
-        key="list"
-        flexDirection="column"
-        gap={space(k, 4, 1)}
-        paddingX={space(k, 12, 0)}
-        paddingTop={space(k, 4, 0)}
-        paddingBottom={space(k, 16, 0)}
-      >
-        {agents.length === 0 ? (
-          <Box key="empty" flexDirection="column" paddingX={space(k, 8, 0)} paddingY={space(k, 12, 0)}>
-            <Text color={k.p.muted}>No subagents running</Text>
-            <Text color={k.p.muted}>Each one shows up here as it starts.</Text>
-          </Box>
-        ) : (
-          agents.map(agent => row(k, agent, actions))
-        )}
-      </Box>
+        </Text>,
+      )}
+      {listBody(
+        k,
+        'list',
+        hasFinished,
+        agents.length === 0
+          ? listNote(k, 'empty', ['No subagents running', 'Each one shows up here as it starts.'])
+          : live.length === 0
+            ? listNote(k, 'no-running', ['No agents running'])
+            : live.map(agent => row(k, agent, actions)),
+      )}
+      {hasFinished ? hairline(k, 'finished-rule') : null}
+      {hasFinished ? listHead(k, 'finished-label', `Finished · ${finished.length}`, null) : null}
+      {hasFinished ? listBody(k, 'finished-list', false, finished.map(agent => row(k, agent, actions))) : null}
     </Box>
   )
 }

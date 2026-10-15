@@ -288,6 +288,8 @@ async function gather($: EngineInterface): Promise<Drawn> {
       state: row.state,
       isLive: row.isLive,
       elapsedMs: row.elapsedMs,
+      startedAt: row.startedAt,
+      endedAt: row.endedAt,
       isApproximate: one?.isApproximate === true,
       model: one?.model,
       effort: one?.effort,

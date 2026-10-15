@@ -19,7 +19,7 @@ import {
   projectKey,
   windowFor,
 } from '../hooks/format'
-import { buildRows, rowStateOf } from '../hooks/rows'
+import { buildRows, rowStateOf, sections } from '../hooks/rows'
 
 const PLUGIN = 'subagent-monitor'
 const SURFACES = ['terminal', 'desktop'] as const
@@ -235,6 +235,30 @@ test('rows: done subagents stay after the engine drops them; quiet workflow agen
   expect(rowStateOf('completed', 'failed')).toBe('failed')
 })
 
+test('sections: live rows latest start first, finished rows latest end first, unknown times last', () => {
+  const at = (id: string, isLive: boolean, startedAt?: number, endedAt?: number) => ({ id, isLive, startedAt, endedAt })
+  const { live, finished } = sections([
+    at('old', true, 10),
+    at('f-mid', false, 0, 50),
+    at('anon', true),
+    at('new', true, 30),
+    at('f-late', false, 0, 90),
+    at('f-anon', false, 5),
+  ])
+  expect(live.map(one => one.id)).toEqual(['new', 'old', 'anon'])
+  expect(finished.map(one => one.id)).toEqual(['f-late', 'f-mid', 'f-anon'])
+
+  // A row's end: its recorded end, else its last sign of life; none while live.
+  const known = {
+    a: { startedAt: 0, touchedAt: 70_000, isSubagent: true, endedAt: 40_000, outcome: 'completed' as const },
+    b: { startedAt: 0, touchedAt: 60_000, isSubagent: true },
+  }
+  expect(buildRows([], known, 100_000).map(one => [one.id, one.startedAt, one.endedAt])).toEqual([
+    ['a', 0, 40_000],
+    ['b', 0, 60_000],
+  ])
+})
+
 test('detail: prompt, a timeline of tool calls and words, the last words as the result', () => {
   const detail = buildDetail(CONVERSATION)
   expect(detail.prompt).toStartWith('Map every endpoint.')
@@ -408,6 +432,93 @@ test('cost and tokens follow each response', async ($, on) => {
   expect(await ui.find({ type: 'Text', text: '90.5k' })).toBeDefined()
   expect(await ui.find({ type: 'Text', text: 'No subagents running' })).toBeDefined()
   await ui.unmount()
+})
+
+test('the list puts live agents first and the finished ones after a rule, under FINISHED with their count', async ($, on) => {
+  const world: World = {
+    list: [
+      { ...running, id: 'a2', description: 'old job', type: 'Plan', status: 'completed' },
+      running,
+      { ...running, id: 'a3', description: 'broke', status: 'failed' },
+    ],
+    isPaneUp: true,
+  }
+  engine(on, world)
+  await $.agent.spawn(SPAWN)
+
+  for (const surface of SURFACES) {
+    const ui = await $.ui.mount({ ...PANE, surface })
+    const live = (await ui.find({ key: 'list' }))?.text
+    expect(live).toContain('scan repo')
+    expect(live).not.toContain('old job')
+    expect(live).not.toContain('broke')
+    const done = (await ui.find({ key: 'finished-list' }))?.text
+    expect(done).toContain('old job')
+    expect(done).toContain('broke')
+    expect(done).not.toContain('scan repo')
+    expect((await ui.find({ key: 'finished-label' }))?.text).toContain('FINISHED · 2')
+    expect(await ui.find({ type: 'Text', text: /1 running/ })).toBeDefined()
+    expect(await ui.find({ key: 'no-running' })).toBeUndefined()
+
+    // Document order: the live row, then the rule and the label, then the finished rows.
+    const boxes = (await ui.findAll({ type: 'Box' })).map(one => one.key)
+    const at = (key: string) => boxes.indexOf(key)
+    expect(at('agent-a1')).toBeGreaterThanOrEqual(0)
+    expect(at('agent-a1')).toBeLessThan(at('finished-label'))
+    expect(at('finished-label')).toBeLessThan(at('agent-a2'))
+    expect(at('finished-label')).toBeLessThan(at('agent-a3'))
+
+    // The rule sits between the live row and the label, on both surfaces.
+    const rule = await ui.find({ key: 'finished-rule' })
+    expect(rule).toBeDefined()
+    expect(at('agent-a1')).toBeLessThan(at('finished-rule'))
+    expect(at('finished-rule')).toBeLessThan(at('finished-label'))
+    if (surface === 'terminal') {
+      // The terminal separates with a full-width line of `─` and a text label.
+      expect(rule?.text).toBe('─'.repeat(PANE.props.bodyColumns))
+    } else {
+      // The desktop: a full-width 1px hairline in the border colour.
+      const fill = (await ui.find({ key: 'finished-rule-0' }))?.children.find(
+        (child): child is { type: string; props: Record<string, unknown> } =>
+          typeof child === 'object' && child !== null && (child as { type?: string }).type === 'Svg',
+      )
+      expect(String(fill?.props.source)).toContain('height="1"')
+      expect(String(fill?.props.source)).toContain('fill="#2A2A31"')
+    }
+    await ui.unmount()
+  }
+})
+
+test('with no finished agent the list has no FINISHED section', async ($, on) => {
+  engine(on, { list: [running], isPaneUp: true })
+  await $.agent.spawn(SPAWN)
+
+  for (const surface of SURFACES) {
+    const ui = await $.ui.mount({ ...PANE, surface })
+    expect(await ui.find({ key: 'agent-a1' })).toBeDefined()
+    expect(await ui.find({ key: 'finished-rule' })).toBeUndefined()
+    expect(await ui.find({ key: 'finished-label' })).toBeUndefined()
+    expect(await ui.find({ key: 'finished-list' })).toBeUndefined()
+    expect(await ui.find({ type: 'Text', text: /FINISHED/ })).toBeUndefined()
+    expect(await ui.find({ key: 'no-running' })).toBeUndefined()
+    await ui.unmount()
+  }
+})
+
+test('with only finished agents the live section says No agents running', async ($, on) => {
+  engine(on, { list: [{ ...running, status: 'completed' }], isPaneUp: true })
+  await $.agent.spawn(SPAWN)
+
+  for (const surface of SURFACES) {
+    const ui = await $.ui.mount({ ...PANE, surface })
+    expect((await ui.find({ key: 'no-running' }))?.text).toContain('No agents running')
+    expect((await ui.find({ key: 'list' }))?.text).not.toContain('scan repo')
+    expect(await ui.find({ key: 'empty' })).toBeUndefined()
+    expect(await ui.find({ key: 'finished-rule' })).toBeDefined()
+    expect((await ui.find({ key: 'finished-label' }))?.text).toContain('FINISHED · 1')
+    expect((await ui.find({ key: 'finished-list' }))?.text).toContain('scan repo')
+    await ui.unmount()
+  }
 })
 
 // ---- Detail ------------------------------------------------------------------------

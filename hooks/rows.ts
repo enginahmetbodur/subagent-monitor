@@ -32,6 +32,10 @@ export type Row = {
   record: SubagentMonitorAgent | undefined
   /** Undefined when the mod never saw it start. */
   elapsedMs: number | undefined
+  /** When it started; undefined when the mod never saw it start. */
+  startedAt: number | undefined
+  /** When it ended (its last sign of life when the mod missed the end); undefined while live. */
+  endedAt: number | undefined
 }
 
 const elapsedOf = (record: SubagentMonitorAgent | undefined, isLive: boolean, now: number) => {
@@ -41,6 +45,9 @@ const elapsedOf = (record: SubagentMonitorAgent | undefined, isLive: boolean, no
 
   return Math.max(0, end - record.startedAt)
 }
+
+const endedAtOf = (record: SubagentMonitorAgent | undefined, isLive: boolean) =>
+  isLive ? undefined : (record?.endedAt ?? record?.touchedAt)
 
 /**
  * The engine's listed agents, then the subagents it no longer lists (it drops a
@@ -61,6 +68,8 @@ export const buildRows = (list: readonly AgentInfo[], known: SubagentMonitorAgen
       isWorkflow: false,
       record,
       elapsedMs: elapsedOf(record, isLive, now),
+      startedAt: record?.startedAt,
+      endedAt: endedAtOf(record, isLive),
     }
   })
 
@@ -83,6 +92,8 @@ export const buildRows = (list: readonly AgentInfo[], known: SubagentMonitorAgen
         isWorkflow,
         record,
         elapsedMs: elapsedOf(record, isLive, now),
+        startedAt: record.startedAt,
+        endedAt: endedAtOf(record, isLive),
       },
     ]
   })
@@ -91,3 +102,24 @@ export const buildRows = (list: readonly AgentInfo[], known: SubagentMonitorAgen
 
   return [...all.filter(row => row.isLive), ...all.filter(row => !row.isLive)]
 }
+
+type Timed = { isLive: boolean; startedAt?: number | undefined; endedAt?: number | undefined }
+
+/** Latest first by `time`; an unknown time sorts last, ties keep their order. */
+const latestFirst = <T>(items: readonly T[], time: (item: T) => number | undefined): T[] =>
+  [...items].sort((a, b) => (time(b) ?? Number.NEGATIVE_INFINITY) - (time(a) ?? Number.NEGATIVE_INFINITY) || 0)
+
+/**
+ * The pane list's two sections: the live agents, most recently started first,
+ * then the finished ones (anything not live), most recently ended first.
+ */
+export const sections = <T extends Timed>(rows: readonly T[]): { live: T[]; finished: T[] } => ({
+  live: latestFirst(
+    rows.filter(row => row.isLive),
+    row => row.startedAt,
+  ),
+  finished: latestFirst(
+    rows.filter(row => !row.isLive),
+    row => row.endedAt,
+  ),
+})
