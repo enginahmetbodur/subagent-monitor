@@ -46,6 +46,12 @@ export type SubagentMonitorView = {
   isResultOpen: boolean
 }
 
+/** Which list sections the person folded away: true hides that section's rows, never its head. */
+export type SubagentMonitorCollapsed = {
+  live: boolean
+  finished: boolean
+}
+
 declare module 'claude-code' {
   interface PluginState {
     'subagent-monitor': {
@@ -60,6 +66,8 @@ declare module 'claude-code' {
       /** The model id the main loop's requests name, to give subagents on it the session's window. */
       mainModel: string | null
       view: SubagentMonitorView
+      /** The list's folded sections; both open by default, mirrored to `$.store` under `collapsed`. */
+      collapsed: SubagentMonitorCollapsed
     }
   }
 }

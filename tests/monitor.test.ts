@@ -521,6 +521,161 @@ test('with only finished agents the live section says No agents running', async 
   }
 })
 
+// ---- Folding the sections ---------------------------------------------------------------
+
+/** One live agent (a1) and two finished ones (a2, a3). */
+const MIXED: AgentInfo[] = [
+  { ...running, id: 'a2', description: 'old job', type: 'Plan', status: 'completed' },
+  running,
+  { ...running, id: 'a3', description: 'broke', status: 'failed' },
+]
+
+test('a click on the AGENTS head folds the live rows behind ▸ and unfolds them again', async ($, on) => {
+  const clock = engine(on, { list: MIXED, isPaneUp: true })
+  await $.agent.spawn(SPAWN)
+
+  for (const surface of SURFACES) {
+    let ui = await $.ui.mount({ ...PANE, surface })
+    expect((await ui.find({ key: 'toggle-live' }))?.text).toContain('▾ AGENTS')
+    expect(await ui.find({ key: 'agent-a1' })).toBeDefined()
+
+    await ui.press({ key: 'toggle-live' })
+    expect((await ui.find({ key: 'toggle-live' }))?.text).toContain('▸ AGENTS')
+    expect(await ui.find({ key: 'list' })).toBeUndefined()
+    expect(await ui.find({ key: 'agent-a1' })).toBeUndefined()
+    // The summary stays at the head's right; the finished section is untouched.
+    expect((await ui.find({ key: 'list-head' }))?.text).toMatch(/1 running · 2 done/)
+    expect((await ui.find({ key: 'finished-list' }))?.text).toContain('old job')
+    expect((await ui.find({ key: 'toggle-finished' }))?.text).toContain('▾ FINISHED · 2')
+
+    // A redraw (the ticker's) and a fresh mount both keep the fold.
+    await clock.advance(1_000)
+    expect(await ui.find({ key: 'agent-a1' })).toBeUndefined()
+    await ui.unmount()
+    ui = await $.ui.mount({ ...PANE, surface })
+    expect((await ui.find({ key: 'toggle-live' }))?.text).toContain('▸ AGENTS')
+    expect(await ui.find({ key: 'agent-a1' })).toBeUndefined()
+
+    await ui.press({ key: 'toggle-live' })
+    expect((await ui.find({ key: 'toggle-live' }))?.text).toContain('▾ AGENTS')
+    expect((await ui.find({ key: 'list' }))?.text).toContain('scan repo')
+    await ui.unmount()
+  }
+})
+
+test('a folded live section hides its notes too', async ($, on) => {
+  const world: World = { list: [], isPaneUp: true }
+  engine(on, world)
+
+  for (const surface of SURFACES) {
+    const ui = await $.ui.mount({ ...PANE, surface })
+    expect(await ui.find({ key: 'empty' })).toBeDefined()
+    await ui.press({ key: 'toggle-live' })
+    expect(await ui.find({ key: 'empty' })).toBeUndefined()
+    expect((await ui.find({ key: 'list-head' }))?.text).toMatch(/0 running · 0 done/)
+    await ui.press({ key: 'toggle-live' })
+    await ui.unmount()
+  }
+
+  world.list = [{ ...running, status: 'completed' }]
+  await $.agent.spawn(SPAWN)
+  for (const surface of SURFACES) {
+    const ui = await $.ui.mount({ ...PANE, surface })
+    expect(await ui.find({ key: 'no-running' })).toBeDefined()
+    await ui.press({ key: 'toggle-live' })
+    expect(await ui.find({ key: 'no-running' })).toBeUndefined()
+    expect((await ui.find({ key: 'finished-list' }))?.text).toContain('scan repo')
+    await ui.press({ key: 'toggle-live' })
+    await ui.unmount()
+  }
+})
+
+test('a click on the FINISHED head folds its rows, keeping the rule and the label; detail and Back keep it', async ($, on) => {
+  const clock = engine(on, { list: MIXED, isPaneUp: true })
+  await $.agent.spawn(SPAWN)
+
+  for (const surface of SURFACES) {
+    let ui = await $.ui.mount({ ...PANE, surface })
+    await ui.press({ key: 'toggle-finished' })
+    expect(await ui.find({ key: 'finished-rule' })).toBeDefined()
+    expect((await ui.find({ key: 'finished-label' }))?.text).toContain('▸ FINISHED · 2')
+    expect(await ui.find({ key: 'finished-list' })).toBeUndefined()
+    expect(await ui.find({ key: 'agent-a2' })).toBeUndefined()
+    expect(await ui.find({ key: 'agent-a3' })).toBeUndefined()
+    // The live section stays open.
+    expect((await ui.find({ key: 'toggle-live' }))?.text).toContain('▾ AGENTS')
+    expect(await ui.find({ key: 'agent-a1' })).toBeDefined()
+
+    await clock.advance(1_000)
+    expect(await ui.find({ key: 'finished-list' })).toBeUndefined()
+    await ui.unmount()
+    ui = await $.ui.mount({ ...PANE, surface })
+    expect((await ui.find({ key: 'finished-label' }))?.text).toContain('▸ FINISHED · 2')
+
+    // A row still opens its detail, and Back returns to the list as it was folded.
+    await ui.press({ key: 'open-a1' })
+    expect(await ui.find({ key: 'back' })).toBeDefined()
+    await ui.press({ key: 'back' })
+    expect(await ui.find({ key: 'agent-a1' })).toBeDefined()
+    expect(await ui.find({ key: 'finished-list' })).toBeUndefined()
+
+    await ui.press({ key: 'toggle-finished' })
+    expect((await ui.find({ key: 'finished-label' }))?.text).toContain('▾ FINISHED · 2')
+    expect((await ui.find({ key: 'finished-list' }))?.text).toContain('old job')
+    await ui.unmount()
+  }
+})
+
+test('the folds are kept in the store and read back when a session starts', async ($, on) => {
+  mock.store(on, { collapsed: { live: true, finished: true } })
+  engine(on, { list: MIXED, isPaneUp: false })
+  await $.agent.spawn(SPAWN)
+  await $.session.start({ cwd: 'C:/proj', surface: 'terminal', isInteractive: true })
+
+  for (const surface of SURFACES) {
+    const ui = await $.ui.mount({ ...PANE, surface })
+    expect((await ui.find({ key: 'toggle-live' }))?.text).toContain('▸ AGENTS')
+    expect((await ui.find({ key: 'finished-label' }))?.text).toContain('▸ FINISHED · 2')
+    expect(await ui.find({ key: 'list' })).toBeUndefined()
+    expect(await ui.find({ key: 'finished-list' })).toBeUndefined()
+    await ui.unmount()
+  }
+})
+
+test('a malformed stored fold is ignored: both sections open', async ($, on) => {
+  mock.store(on, { collapsed: { live: 'yes' } })
+  engine(on, { list: MIXED, isPaneUp: false })
+  await $.agent.spawn(SPAWN)
+  await $.session.start({ cwd: 'C:/proj', surface: 'terminal', isInteractive: true })
+
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  expect((await ui.find({ key: 'toggle-live' }))?.text).toContain('▾ AGENTS')
+  expect(await ui.find({ key: 'agent-a1' })).toBeDefined()
+  expect(await ui.find({ key: 'finished-list' })).toBeDefined()
+  await ui.unmount()
+})
+
+test('each fold is written to the store', async ($, on) => {
+  const saved: Record<string, unknown> = {}
+  on('store.get', (_$, e) => ({ value: saved[e.key] }))
+  on('store.set', (_$, e) => {
+    saved[e.key] = e.value
+
+    return { value: undefined }
+  })
+  engine(on, { list: MIXED, isPaneUp: true })
+  await $.agent.spawn(SPAWN)
+
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  await ui.press({ key: 'toggle-live' })
+  expect(saved.collapsed).toEqual({ live: true, finished: false })
+  await ui.press({ key: 'toggle-finished' })
+  expect(saved.collapsed).toEqual({ live: true, finished: true })
+  await ui.press({ key: 'toggle-live' })
+  expect(saved.collapsed).toEqual({ live: false, finished: true })
+  await ui.unmount()
+})
+
 // ---- Detail ------------------------------------------------------------------------
 
 test('a row opens its detail: prompt with Show more, live timeline, Back returns to the list', async ($, on) => {

@@ -10,7 +10,7 @@
 
 import type { Elements, RenderElement } from 'claude-code'
 
-import type { SubagentMonitorTotals } from '../types'
+import type { SubagentMonitorCollapsed, SubagentMonitorTotals } from '../types'
 import type { AgentDetail, TimelineItem } from './detail'
 import { clampLines } from './detail'
 import { effortLevel, filledCells, formatElapsed, formatTokens, formatUsd, modelFamily, modelName } from './format'
@@ -109,6 +109,8 @@ export type Actions = {
   back: () => unknown
   togglePrompt: () => unknown
   toggleResult: () => unknown
+  toggleLive: () => unknown
+  toggleFinished: () => unknown
 }
 
 // ---- Small pieces -------------------------------------------------------------
@@ -493,20 +495,31 @@ const row = (k: Kit, agent: AgentView, actions: Actions) => {
   )
 }
 
-/** A section's head row: the uppercase label, and what sits at its right. */
-const listHead = (k: Kit, key: string, name: string, right: unknown) => {
-  const { Box } = k
+/** What a section's head toggles: its Button's key, whether it is folded, the press. */
+type Fold = { key: string; isCollapsed: boolean; toggle: () => unknown }
+
+/**
+ * A section's head row: the uppercase label behind its chevron (▾ open, ▸
+ * folded) as one plain Button, so a click on it folds the section; and what
+ * sits at its right, outside the Button (a Button holds Text alone). A folded
+ * section with another below keeps the gap its rows would have left.
+ */
+const listHead = (k: Kit, key: string, name: string, fold: Fold, gapAfter: boolean, right: unknown) => {
+  const { Box, Button } = k
 
   return (
     <Box
       key={key}
       flexDirection="row"
       justifyContent="space-between"
+      alignItems="center"
       paddingX={space(k, 20, 0)}
       paddingTop={space(k, 12, 1)}
-      paddingBottom={space(k, 4, 0)}
+      paddingBottom={fold.isCollapsed ? space(k, 16, gapAfter ? 1 : 0) : space(k, 4, 0)}
     >
-      {label(k, name)}
+      <Button key={fold.key} plain onPress={fold.toggle}>
+        {label(k, `${fold.isCollapsed ? '▸' : '▾'} ${name}`)}
+      </Button>
       {right as never}
     </Box>
   )
@@ -547,9 +560,16 @@ const listNote = (k: Kit, key: string, lines: string[]) => {
 
 /**
  * The list: the live agents under AGENTS, then, past a rule, the finished ones
- * under FINISHED (left out when none has finished).
+ * under FINISHED (left out when none has finished). Either section folds by a
+ * click on its head: its rows and notes go, its head (and FINISHED's rule) stay.
  */
-export const listPane = (k: Kit, s: SummaryView, agents: AgentView[], actions: Actions): RenderElement => {
+export const listPane = (
+  k: Kit,
+  s: SummaryView,
+  agents: AgentView[],
+  collapsed: SubagentMonitorCollapsed,
+  actions: Actions,
+): RenderElement => {
   const { Box, Text } = k
   const { live, finished } = sections(agents)
   const hasFinished = finished.length > 0
@@ -564,23 +584,38 @@ export const listPane = (k: Kit, s: SummaryView, agents: AgentView[], actions: A
         k,
         'list-head',
         'Agents',
+        { key: 'toggle-live', isCollapsed: collapsed.live, toggle: actions.toggleLive },
+        hasFinished,
         <Text color={k.p.muted}>
           <Text color={k.p.running}>{s.running} running</Text> · {s.done} done
         </Text>,
       )}
-      {listBody(
-        k,
-        'list',
-        hasFinished,
-        agents.length === 0
-          ? listNote(k, 'empty', ['No subagents running', 'Each one shows up here as it starts.'])
-          : live.length === 0
-            ? listNote(k, 'no-running', ['No agents running'])
-            : live.map(agent => row(k, agent, actions)),
-      )}
+      {collapsed.live
+        ? null
+        : listBody(
+            k,
+            'list',
+            hasFinished,
+            agents.length === 0
+              ? listNote(k, 'empty', ['No subagents running', 'Each one shows up here as it starts.'])
+              : live.length === 0
+                ? listNote(k, 'no-running', ['No agents running'])
+                : live.map(agent => row(k, agent, actions)),
+          )}
       {hasFinished ? hairline(k, 'finished-rule') : null}
-      {hasFinished ? listHead(k, 'finished-label', `Finished · ${finished.length}`, null) : null}
-      {hasFinished ? listBody(k, 'finished-list', false, finished.map(agent => row(k, agent, actions))) : null}
+      {hasFinished
+        ? listHead(
+            k,
+            'finished-label',
+            `Finished · ${finished.length}`,
+            { key: 'toggle-finished', isCollapsed: collapsed.finished, toggle: actions.toggleFinished },
+            false,
+            null,
+          )
+        : null}
+      {hasFinished && !collapsed.finished
+        ? listBody(k, 'finished-list', false, finished.map(agent => row(k, agent, actions)))
+        : null}
     </Box>
   )
 }

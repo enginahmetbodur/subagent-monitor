@@ -1,7 +1,13 @@
 import { atom, read, update } from 'claude-code'
 import type { AgentInfo, EngineInterface, ModelUsage, Register, SessionUsage, Timer } from 'claude-code'
 
-import type { SubagentMonitorAgent, SubagentMonitorAgents, SubagentMonitorTotals, SubagentMonitorView } from '../types'
+import type {
+  SubagentMonitorAgent,
+  SubagentMonitorAgents,
+  SubagentMonitorCollapsed,
+  SubagentMonitorTotals,
+  SubagentMonitorView,
+} from '../types'
 import { buildDetail } from './detail'
 import {
   allTokensOf,
@@ -26,6 +32,9 @@ const DETAIL_MS = 2000
 
 const ZERO: SubagentMonitorTotals = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }
 const LIST_VIEW: SubagentMonitorView = { agentId: null, isPromptOpen: false, isResultOpen: false }
+const EXPANDED: SubagentMonitorCollapsed = { live: false, finished: false }
+/** The `$.store` key the folded sections are kept under between sessions. */
+const COLLAPSED_KEY = 'collapsed'
 
 const agents = atom({ plugin: 'subagent-monitor', key: 'agents' } as const, {})
 const totals = atom({ plugin: 'subagent-monitor', key: 'totals' } as const, ZERO)
@@ -34,6 +43,8 @@ const mainModel = atom({ plugin: 'subagent-monitor', key: 'mainModel' } as const
 const view = atom({ plugin: 'subagent-monitor', key: 'view' } as const, LIST_VIEW)
 const autoOpened = atom({ plugin: 'subagent-monitor', key: 'autoOpened' } as const, false)
 const closedByHand = atom({ plugin: 'subagent-monitor', key: 'closedByHand' } as const, false)
+// Its own atom, not part of `view`: closing the pane resets the view, never the folds.
+const collapsed = atom({ plugin: 'subagent-monitor', key: 'collapsed' } as const, EXPANDED)
 
 type Patch = Partial<Omit<SubagentMonitorAgent, 'touchedAt'>>
 
@@ -252,6 +263,22 @@ async function toggleSection($: EngineInterface, section: 'isPromptOpen' | 'isRe
   await update($, view, current => ({ ...current, [section]: !current[section] }))
 }
 
+/** Folds or unfolds one list section: the session's value first, then the copy kept across sessions. */
+async function toggleList($: EngineInterface, part: keyof SubagentMonitorCollapsed): Promise<void> {
+  const next = await update($, collapsed, current => ({ ...current, [part]: !current[part] }))
+  await safe(() => $.store.set(COLLAPSED_KEY, next), undefined)
+}
+
+/** The folds kept from an earlier session, when the store holds a well-formed pair. */
+async function restoreCollapsed($: EngineInterface): Promise<void> {
+  const kept = await $.store.get(COLLAPSED_KEY)
+  if (typeof kept !== 'object' || kept === null) return
+  const { live, finished } = kept as Partial<Record<keyof SubagentMonitorCollapsed, unknown>>
+  if (typeof live !== 'boolean' || typeof finished !== 'boolean') return
+
+  await update($, collapsed, () => ({ live, finished }))
+}
+
 /** Every press the drawing can make, bound to this hook's `$`. */
 function actionsFor($: EngineInterface): Actions {
   return {
@@ -260,6 +287,8 @@ function actionsFor($: EngineInterface): Actions {
     back: () => showDetail($, null),
     togglePrompt: () => toggleSection($, 'isPromptOpen'),
     toggleResult: () => toggleSection($, 'isResultOpen'),
+    toggleLive: () => toggleList($, 'live'),
+    toggleFinished: () => toggleList($, 'finished'),
   }
 }
 
@@ -343,6 +372,7 @@ export const register: Register = on => {
         }),
       undefined,
     )
+    await safe(() => restoreCollapsed($), undefined)
     await safe(async () => {
       const isShown = await isPaneShown($)
       const wanted = await read($, isOpen)
@@ -477,11 +507,12 @@ export const register: Register = on => {
     const k = kitFor($.ui.resolve(e), e.surface, e.props.bodyColumns, drawn.now)
     const actions = actionsFor($)
     const screen = await safe(() => read($, view), LIST_VIEW)
+    const folds = await safe(() => read($, collapsed), EXPANDED)
 
     const index = screen.agentId === null ? -1 : drawn.agents.findIndex(agent => agent.id === screen.agentId)
     const agent = drawn.agents[index]
     const row = drawn.rows[index]
-    if (agent === undefined || row === undefined) return listPane(k, drawn.summary, drawn.agents, actions)
+    if (agent === undefined || row === undefined) return listPane(k, drawn.summary, drawn.agents, folds, actions)
 
     const detail = await safe(() => fetchDetail($, agent.id, agent.isLive, row.isWorkflow), {
       kind: 'unavailable',
