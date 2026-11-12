@@ -2,12 +2,16 @@ import { atom, read, update } from 'claude-code'
 import type { AgentInfo, EngineInterface, ModelUsage, Register, SessionUsage, Timer } from 'claude-code'
 
 import type {
+  SubagentMonitorActivity,
   SubagentMonitorAgent,
   SubagentMonitorAgents,
   SubagentMonitorCollapsed,
+  SubagentMonitorLinks,
   SubagentMonitorTotals,
   SubagentMonitorView,
 } from '../types'
+import { endActivity, feedRows, labelFor, pushActivity } from './activity'
+import type { FeedRow } from './activity'
 import { buildDetail } from './detail'
 import {
   allTokensOf,
@@ -19,6 +23,8 @@ import {
   projectKey,
   windowFor,
 } from './format'
+import { addLink, buildGraph, resolveRecipient, ROOT } from './graph'
+import type { Graph } from './graph'
 import { buildRows } from './rows'
 import type { Row } from './rows'
 import { band, detailPane, kitFor, listPane } from './view'
@@ -32,7 +38,7 @@ const DETAIL_MS = 2000
 
 const ZERO: SubagentMonitorTotals = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }
 const LIST_VIEW: SubagentMonitorView = { agentId: null, isPromptOpen: false, isResultOpen: false }
-const EXPANDED: SubagentMonitorCollapsed = { live: false, finished: false }
+const EXPANDED: SubagentMonitorCollapsed = { live: false, finished: false, map: false }
 /** The `$.store` key the folded sections are kept under between sessions. */
 const COLLAPSED_KEY = 'collapsed'
 
@@ -45,6 +51,11 @@ const autoOpened = atom({ plugin: 'subagent-monitor', key: 'autoOpened' } as con
 const closedByHand = atom({ plugin: 'subagent-monitor', key: 'closedByHand' } as const, false)
 // Its own atom, not part of `view`: closing the pane resets the view, never the folds.
 const collapsed = atom({ plugin: 'subagent-monitor', key: 'collapsed' } as const, EXPANDED)
+const links = atom({ plugin: 'subagent-monitor', key: 'links' } as const, {} as SubagentMonitorLinks)
+const activity = atom({ plugin: 'subagent-monitor', key: 'activity' } as const, [] as SubagentMonitorActivity[])
+
+/** The last activity id handed out; seeded past the stored ones, so a reload never reuses one. */
+let activitySeq = 0
 
 type Patch = Partial<Omit<SubagentMonitorAgent, 'touchedAt'>>
 
@@ -197,10 +208,16 @@ async function tick($: EngineInterface): Promise<void> {
   const now = await $.clock.now()
 
   // Listed agents are subagents; one with no record has run since before the mod loaded.
-  for (const agent of list.filter(a => all[a.id]?.isSubagent !== true)) {
-    const isNew = all[agent.id] === undefined
-    await record($, agent.id, { isSubagent: true, description: agent.description, type: agent.type })
-    if (isNew) void resolveStart($, agent.id).catch(() => undefined)
+  // The list also gives the map an agent's parent and name when its spawn was missed.
+  for (const agent of list) {
+    const one = all[agent.id]
+    const patch: Patch = {}
+    if (one?.isSubagent !== true) Object.assign(patch, { isSubagent: true, description: agent.description, type: agent.type })
+    if (one?.parentId === undefined && agent.parentId !== undefined) patch.parentId = agent.parentId
+    if (one?.name === undefined && agent.name !== undefined) patch.name = agent.name
+    if (Object.keys(patch).length === 0) continue
+    await record($, agent.id, patch)
+    if (one === undefined) void resolveStart($, agent.id).catch(() => undefined)
   }
 
   // An agent can stop without a turn.complete (killed); a listed one that left the
@@ -269,14 +286,14 @@ async function toggleList($: EngineInterface, part: keyof SubagentMonitorCollaps
   await safe(() => $.store.set(COLLAPSED_KEY, next), undefined)
 }
 
-/** The folds kept from an earlier session, when the store holds a well-formed pair. */
+/** The folds kept from an earlier session, when the store holds a well-formed pair (the map's, kept since 0.6, is optional). */
 async function restoreCollapsed($: EngineInterface): Promise<void> {
   const kept = await $.store.get(COLLAPSED_KEY)
   if (typeof kept !== 'object' || kept === null) return
-  const { live, finished } = kept as Partial<Record<keyof SubagentMonitorCollapsed, unknown>>
+  const { live, finished, map } = kept as Partial<Record<keyof SubagentMonitorCollapsed, unknown>>
   if (typeof live !== 'boolean' || typeof finished !== 'boolean') return
 
-  await update($, collapsed, () => ({ live, finished }))
+  await update($, collapsed, () => ({ live, finished, map: typeof map === 'boolean' ? map : false }))
 }
 
 /** Every press the drawing can make, bound to this hook's `$`. */
@@ -289,12 +306,13 @@ function actionsFor($: EngineInterface): Actions {
     toggleResult: () => toggleSection($, 'isResultOpen'),
     toggleLive: () => toggleList($, 'live'),
     toggleFinished: () => toggleList($, 'finished'),
+    toggleMap: () => toggleList($, 'map'),
   }
 }
 
 // ---- What the drawings show -------------------------------------------------------
 
-type Drawn = { summary: SummaryView; agents: AgentView[]; rows: Row[]; now: number }
+type Drawn = { summary: SummaryView; agents: AgentView[]; rows: Row[]; graph: Graph; feed: FeedRow[]; now: number }
 
 /** Folds the engine's figures and the mod's records into the plain data the view draws. */
 async function gather($: EngineInterface): Promise<Drawn> {
@@ -304,6 +322,8 @@ async function gather($: EngineInterface): Promise<Drawn> {
   const list = await safe(() => $.agent.list(), [] as AgentInfo[])
   const usage = await safe<SessionUsage | undefined>(() => $.session.usage(), undefined)
   const now = await safe(() => $.clock.now(), 0)
+  const said = await safe(() => read($, links), {} as SubagentMonitorLinks)
+  const calls = await safe(() => read($, activity), [] as SubagentMonitorActivity[])
 
   const rows = buildRows(list, known, now)
   const views = rows.map((row): AgentView => {
@@ -335,6 +355,8 @@ async function gather($: EngineInterface): Promise<Drawn> {
     .reduce((sum, one) => sum + (one.costUsd ?? 0), 0)
   const costUsd = usage?.cost?.usd
   const running = rows.filter(row => row.isLive).length
+  const graph = buildGraph(rows, said, main, now)
+  const onMap = new Map(graph.nodes.slice(1).map(node => [node.id, node.label]))
 
   return {
     summary: {
@@ -348,6 +370,8 @@ async function gather($: EngineInterface): Promise<Drawn> {
     },
     agents: views,
     rows,
+    graph,
+    feed: feedRows(calls, onMap, now),
     now,
   }
 }
@@ -435,6 +459,8 @@ export const register: Register = on => {
           description: e.description,
           type: e.subagentType,
           ...(e.workflow && { workflowRunId: e.workflow.runId }),
+          ...(e.parentAgentId !== undefined ? { parentId: e.parentAgentId } : {}),
+          ...(e.name !== undefined ? { name: e.name } : {}),
         })
         ensureTicker($)
       }, undefined)
@@ -442,6 +468,64 @@ export const register: Register = on => {
 
     return spawned
   }).catch(($, e, next) => next(e))
+
+  // A delivered SendMessage, from the main loop or an agent, to an agent: a link on the map.
+  // Only who and how often; the text is never kept.
+  on('session.send', async ($, e, next) => {
+    const sent = await next(e)
+    if (sent.isDelivered === true) {
+      await safe(async () => {
+        const to = resolveRecipient(e.to, await read($, agents), await $.agent.list())
+        if (to === undefined) return
+        const now = await $.clock.now()
+        await update($, links, current => addLink(current, e.agentId ?? ROOT, to, now))
+        await refreshSoon($)
+      }, undefined)
+    }
+
+    return sent
+    // No `.catch` re-calling `next`: a failing downstream send must never go out twice.
+  })
+
+  // A subagent's tool call: a running entry in the feed, ended with how it went.
+  // Only the tool and labelFor's short label are kept, never its input or output.
+  on('tool.call', async ($, e, next) => {
+    const agentId = e.agentId
+    if (agentId === undefined) return next(e)
+
+    const id = await safe(async () => {
+      const now = await $.clock.now()
+      const stored = await read($, activity)
+      activitySeq = Math.max(activitySeq, ...stored.map(one => one.id))
+      const entry: SubagentMonitorActivity = {
+        id: ++activitySeq,
+        agentId,
+        tool: e.tool,
+        label: labelFor(e.tool, e as unknown as Record<string, unknown>),
+        startedAt: now,
+        status: 'run',
+      }
+      await update($, activity, list => pushActivity(list, entry))
+      ensureTicker($)
+      await refreshSoon($)
+
+      return entry.id
+    }, undefined as number | undefined)
+
+    const result = await next(e)
+
+    if (id !== undefined) {
+      await safe(async () => {
+        const status = result.deny !== undefined ? 'block' : result.isError === true ? 'err' : 'ok'
+        const now = await $.clock.now()
+        await update($, activity, list => endActivity(list, id, status, now))
+        await refreshSoon($)
+      }, undefined)
+    }
+
+    return result
+    // No `.catch` re-calling `next`: a failing tool must never run twice.
+  })
 
   // Every model request: an agent's model and effort on the way down; on the way
   // back its context, tokens and estimated cost, the session's token totals, the
@@ -512,7 +596,7 @@ export const register: Register = on => {
     const index = screen.agentId === null ? -1 : drawn.agents.findIndex(agent => agent.id === screen.agentId)
     const agent = drawn.agents[index]
     const row = drawn.rows[index]
-    if (agent === undefined || row === undefined) return listPane(k, drawn.summary, drawn.agents, folds, actions)
+    if (agent === undefined || row === undefined) return listPane(k, drawn.summary, drawn.agents, drawn.graph, drawn.feed, folds, actions)
 
     const detail = await safe(() => fetchDetail($, agent.id, agent.isLive, row.isWorkflow), {
       kind: 'unavailable',

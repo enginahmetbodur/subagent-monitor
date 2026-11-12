@@ -9,6 +9,15 @@ A Claude Code mod that adds a live **Subagents** pane and a one-line band above 
 - Click a task title to open a detail view with the prompt, a live activity timeline and the final result
 - Click the band, or run `/subagents`, to open or close the pane
 
+## Map
+
+While any subagent runs, the **Map** section above the agent list draws the main loop at the centre and every running subagent around it, one ring per spawn depth. A finished agent leaves the map.
+- Solid lines: who spawned whom. Dashed curves: delivered `SendMessage` traffic, thicker the more often used, with one pulse when a message arrives.
+- A node's ring is its model's colour. A running node beats, and a waiting one has a dashed ring.
+- Up to 24 agents are shown; any more are counted as `+N more`. Only who messaged whom and how often is kept, never the message text.
+- Under the map, a feed shows what each agent is doing: its running tool calls and its last finished one, as a short label (a file, a host, a command's first word), never the call's input or output.
+- Click its head to fold it. The terminal shows the same map as an indented tree followed by `from → to ×count` lines.
+
 ## Install
 
 At the prompt of a terminal Claude Code session:

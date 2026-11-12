@@ -11,9 +11,12 @@
 import type { Elements, RenderElement } from 'claude-code'
 
 import type { SubagentMonitorCollapsed, SubagentMonitorTotals } from '../types'
+import type { FeedRow } from './activity'
 import type { AgentDetail, TimelineItem } from './detail'
 import { clampLines } from './detail'
 import { effortLevel, filledCells, formatElapsed, formatTokens, formatUsd, modelFamily, modelName } from './format'
+import type { Graph } from './graph'
+import { drawGraph, treeLines } from './map'
 import type { RowState } from './rows'
 import { sections } from './rows'
 import type { Palette, TypeLook } from './theme'
@@ -111,6 +114,7 @@ export type Actions = {
   toggleResult: () => unknown
   toggleLive: () => unknown
   toggleFinished: () => unknown
+  toggleMap: () => unknown
 }
 
 // ---- Small pieces -------------------------------------------------------------
@@ -559,20 +563,80 @@ const listNote = (k: Kit, key: string, lines: string[]) => {
 }
 
 /**
+ * The map's drawn width in px on the desktop. No surface reports the pane's
+ * pixel width, so it is estimated from its columns (about 7.5px a column, less
+ * the 40px of padding), kept between 200 and 520.
+ */
+const mapWidthPx = (k: Kit): number => Math.min(520, Math.max(200, Math.round(k.cols * 7.5) - 40))
+
+/**
+ * What the agents on the map are doing: one Text row per call, outside the
+ * SVG, so a tool call never changes the image. Nothing when there is none.
+ */
+const feed = (k: Kit, rows: FeedRow[]) => {
+  const { Box, Text } = k
+  if (rows.length === 0) return null
+
+  return (
+    <Box key="map-feed" flexDirection="column">
+      {rows.map(row => (
+        <Box key={`feed-${row.key}`}>
+          <Text
+            color={row.mark === '●' ? k.p.running : row.mark === '✕' ? k.p.warn : k.p.muted}
+            wrap="truncate-end"
+          >
+            {`${row.mark} ${row.agent}  ${row.tool}  ${row.label}  ${row.tail}`}
+          </Text>
+        </Box>
+      ))}
+    </Box>
+  )
+}
+
+/** The map's body: the SVG on the desktop, the spawn tree and message lines on the terminal; the feed under it. */
+const mapBody = (k: Kit, graph: Graph, rows: FeedRow[]) => {
+  const { Box, Text } = k
+  const picture = k.Svg ? (
+    <Box key="map-svg" flexDirection="row" justifyContent="center">
+      {svg(k, drawGraph(graph, k.p, mapWidthPx(k)), 'Agent map', true)}
+    </Box>
+  ) : (
+    <Box key="map-tree" flexDirection="column">
+      {treeLines(graph).map((line, index) => (
+        <Box key={`map-line-${index}`}>
+          <Text color={index === 0 ? k.p.text : k.p.text2} wrap="truncate-end">
+            {line}
+          </Text>
+        </Box>
+      ))}
+    </Box>
+  )
+
+  return listBody(k, 'map-body', true, [picture, feed(k, rows)])
+}
+
+/**
  * The list: the live agents under AGENTS, then, past a rule, the finished ones
  * under FINISHED (left out when none has finished). Either section folds by a
  * click on its head: its rows and notes go, its head (and FINISHED's rule) stay.
+ * Above them, while any agent runs, the MAP: who spawned and messaged whom,
+ * and what each is doing.
  */
 export const listPane = (
   k: Kit,
   s: SummaryView,
   agents: AgentView[],
+  graph: Graph,
+  activity: FeedRow[],
   collapsed: SubagentMonitorCollapsed,
   actions: Actions,
 ): RenderElement => {
   const { Box, Text } = k
   const { live, finished } = sections(agents)
   const hasFinished = finished.length > 0
+  // The map holds only live agents: with none running it is left out.
+  const hasMap = graph.nodes.length > 1
+  const linkCount = graph.edges.filter(edge => edge.kind === 'message').length
 
   return (
     <Box flexDirection="column">
@@ -580,6 +644,20 @@ export const listPane = (
       {hairline(k, 'rule-header')}
       {summary(k, s)}
       {hairline(k, 'rule-summary')}
+      {hasMap
+        ? listHead(
+            k,
+            'map-head',
+            'Map',
+            { key: 'toggle-map', isCollapsed: collapsed.map, toggle: actions.toggleMap },
+            true,
+            <Text color={k.p.muted}>
+              {graph.nodes.length - 1} running · {linkCount} links
+            </Text>,
+          )
+        : null}
+      {hasMap && !collapsed.map ? mapBody(k, graph, activity) : null}
+      {hasMap ? hairline(k, 'rule-map') : null}
       {listHead(
         k,
         'list-head',

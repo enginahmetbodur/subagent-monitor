@@ -19,7 +19,12 @@ import {
   projectKey,
   windowFor,
 } from '../hooks/format'
+import { ACTIVITY_MAX, endActivity, feedRows, labelFor, pushActivity } from '../hooks/activity'
+import { addLink, buildGraph, layout, resolveRecipient } from '../hooks/graph'
+import { drawGraph, treeLines } from '../hooks/map'
 import { buildRows, rowStateOf, sections } from '../hooks/rows'
+import type { Row } from '../hooks/rows'
+import { DESKTOP } from '../hooks/theme'
 
 const PLUGIN = 'subagent-monitor'
 const SURFACES = ['terminal', 'desktop'] as const
@@ -668,11 +673,13 @@ test('each fold is written to the store', async ($, on) => {
 
   const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
   await ui.press({ key: 'toggle-live' })
-  expect(saved.collapsed).toEqual({ live: true, finished: false })
+  expect(saved.collapsed).toEqual({ live: true, finished: false, map: false })
   await ui.press({ key: 'toggle-finished' })
-  expect(saved.collapsed).toEqual({ live: true, finished: true })
+  expect(saved.collapsed).toEqual({ live: true, finished: true, map: false })
   await ui.press({ key: 'toggle-live' })
-  expect(saved.collapsed).toEqual({ live: false, finished: true })
+  expect(saved.collapsed).toEqual({ live: false, finished: true, map: false })
+  await ui.press({ key: 'toggle-map' })
+  expect(saved.collapsed).toEqual({ live: false, finished: true, map: true })
   await ui.unmount()
 })
 
@@ -859,4 +866,376 @@ test('after a click on the band closes the pane, a prompt leaves it closed', asy
   await $.prompt.submit(typed('hello'))
   expect(world.opens ?? 0).toBe(0)
   expect(world.isPaneUp).toBe(false)
+})
+
+// ---- The map ------------------------------------------------------------------------
+
+type RowOpts = { isLive?: boolean; endedAt?: number; parentId?: string; name?: string }
+
+/** A pane row as buildRows makes one, its record carrying the map's fields. */
+const rowOf = (id: string, opts: RowOpts = {}): Row => {
+  const isLive = opts.isLive ?? true
+
+  return {
+    id,
+    label: id,
+    type: 'Explore',
+    state: isLive ? 'running' : 'done',
+    isLive,
+    isWorkflow: false,
+    record: {
+      startedAt: 0,
+      touchedAt: 0,
+      isSubagent: true,
+      ...(opts.parentId !== undefined ? { parentId: opts.parentId } : {}),
+      ...(opts.name !== undefined ? { name: opts.name } : {}),
+    },
+    elapsedMs: 0,
+    startedAt: 0,
+    endedAt: isLive ? undefined : (opts.endedAt ?? 0),
+  }
+}
+
+/** Each node as [id, parent, depth]. */
+const shape = (rows: Row[]) => buildGraph(rows, {}, null, 0).nodes.map(node => [node.id, node.parent, node.depth])
+
+test('graph: a spawn chain gives depth 1, 2, 3', () => {
+  const g = buildGraph([rowOf('a'), rowOf('b', { parentId: 'a' }), rowOf('c', { parentId: 'b' })], {}, 'claude-opus-5-5', 0)
+  expect(g.nodes.map(node => [node.id, node.parent, node.depth])).toEqual([
+    ['main', null, 0],
+    ['a', 'main', 1],
+    ['b', 'a', 2],
+    ['c', 'b', 3],
+  ])
+  expect(g.nodes[0]).toMatchObject({ label: 'MAIN', state: 'root', model: 'claude-opus-5-5' })
+  expect(g.edges).toEqual([
+    { kind: 'spawn', from: 'main', to: 'a', count: 1 },
+    { kind: 'spawn', from: 'a', to: 'b', count: 1 },
+    { kind: 'spawn', from: 'b', to: 'c', count: 1 },
+  ])
+  expect(g.hidden).toBe(0)
+})
+
+test('graph: an unknown parent attaches to main', () => {
+  expect(shape([rowOf('a', { parentId: 'ghost' }), rowOf('b', { parentId: 'b' })])).toEqual([
+    ['main', null, 0],
+    ['a', 'main', 1],
+    ['b', 'main', 1],
+  ])
+})
+
+test('graph: a parent cycle attaches to main', () => {
+  expect(shape([rowOf('a', { parentId: 'b' }), rowOf('b', { parentId: 'a' }), rowOf('c', { parentId: 'a' })])).toEqual([
+    ['main', null, 0],
+    ['a', 'main', 1],
+    ['b', 'main', 1],
+    ['c', 'a', 2],
+  ])
+})
+
+test('graph: a finished agent leaves the map and its live child attaches to main', () => {
+  const rows = [rowOf('lead', { isLive: false, endedAt: 10 }), rowOf('kid', { parentId: 'lead' }), rowOf('other')]
+  const g = buildGraph(rows, {}, null, 0)
+  expect(g.nodes.map(node => [node.id, node.parent, node.depth])).toEqual([
+    ['main', null, 0],
+    ['kid', 'main', 1],
+    ['other', 'main', 1],
+  ])
+  expect(g.hidden).toBe(0)
+
+  // Labels: the agent's name, else its type, cut at 12.
+  const named = buildGraph([rowOf('n', { name: 'a-very-long-agent-name' }), rowOf('t')], {}, null, 0)
+  expect(named.nodes.map(node => node.label)).toEqual(['MAIN', 'a-very-long…', 'Explore'])
+})
+
+test('graph: more live agents than max are counted hidden', () => {
+  const busy = buildGraph([rowOf('x'), rowOf('done', { isLive: false, endedAt: 1 }), rowOf('y'), rowOf('z')], {}, null, 0, 2)
+  expect(busy.nodes.map(node => node.id)).toEqual(['main', 'x', 'y'])
+  expect(busy.hidden).toBe(1)
+})
+
+test('graph: a message edge needs both ends on the map', () => {
+  let links = addLink({}, 'main', 'a', 1)
+  links = addLink(links, 'a', 'b', 2)
+  links = addLink(links, 'a', 'b', 3)
+  links = addLink(links, 'b', 'gone', 4)
+  links = addLink(links, 'ghost', 'a', 5)
+  links = addLink(links, 'a', 'late', 9_000)
+  const rows = [rowOf('a'), rowOf('b'), rowOf('gone', { isLive: false, endedAt: 1 }), rowOf('late')]
+  const g = buildGraph(rows, links, null, 10_000)
+  expect(g.edges.filter(edge => edge.kind === 'message')).toEqual([
+    { kind: 'message', from: 'a', to: 'b', count: 2, lastAt: 3, isFresh: false },
+    { kind: 'message', from: 'a', to: 'late', count: 1, lastAt: 9_000, isFresh: true },
+    { kind: 'message', from: 'main', to: 'a', count: 1, lastAt: 1, isFresh: false },
+  ])
+  expect(g.hidden).toBe(0)
+})
+
+test('links: resolveRecipient matches id, then name, preferring the latest start', () => {
+  const known = {
+    a1: { startedAt: 10, touchedAt: 10, name: 'scout' },
+    a2: { startedAt: 50, touchedAt: 50, name: 'scout' },
+    a3: { startedAt: 20, touchedAt: 20 },
+  }
+  const list: AgentInfo[] = [
+    { id: 'a3', description: 'x', type: 'Explore', status: 'running', name: 'lead', teammateId: 'lead@team' },
+    { id: 'scout', description: 'y', type: 'Explore', status: 'running' },
+  ]
+  expect(resolveRecipient('a1', known, list)).toBe('a1')
+  // An id wins over a name, even one spelled like it.
+  expect(resolveRecipient('scout', known, list)).toBe('scout')
+  expect(resolveRecipient('scout', known, [])).toBe('a2')
+  expect(resolveRecipient('lead', known, list)).toBe('a3')
+  expect(resolveRecipient('lead@team', known, list)).toBe('a3')
+  expect(resolveRecipient('nobody', known, list)).toBeUndefined()
+  expect(resolveRecipient('', known, list)).toBeUndefined()
+
+  // The live list's names come before the recorded ones: a2 asked for `scout`, the team gave it `scout-2`.
+  const suffixed = { a1: { startedAt: 10, touchedAt: 10, name: 'scout' }, a2: { startedAt: 50, touchedAt: 50, name: 'scout' } }
+  const team: AgentInfo[] = [
+    { id: 'a1', description: 'x', type: 'teammate', status: 'idle', name: 'scout' },
+    { id: 'a2', description: 'y', type: 'teammate', status: 'idle', name: 'scout-2' },
+  ]
+  expect(resolveRecipient('scout', suffixed, team)).toBe('a1')
+  expect(resolveRecipient('scout-2', suffixed, team)).toBe('a2')
+})
+
+test('links: addLink counts repeats and drops the oldest past max', () => {
+  let links = addLink({}, 'main', 'a', 1)
+  links = addLink(links, 'main', 'a', 5)
+  expect(links).toEqual({ 'main>a': { from: 'main', to: 'a', count: 2, lastAt: 5 } })
+  expect(addLink(links, 'a', 'a', 6)).toBe(links)
+
+  let few = addLink({}, 'x', 'a', 1, 2)
+  few = addLink(few, 'x', 'b', 2, 2)
+  few = addLink(few, 'x', 'a', 3, 2)
+  few = addLink(few, 'x', 'c', 4, 2)
+  expect(Object.keys(few).sort()).toEqual(['x>a', 'x>c'])
+  expect(few['x>a']?.count).toBe(2)
+})
+
+/** MAIN -> lead -> b (c finished, off the map); MAIN messaged lead twice, lead messaged b once. */
+const mapGraph = (now: number) => {
+  let links = addLink({}, 'main', 'a', 1_000)
+  links = addLink(links, 'main', 'a', 2_000)
+  links = addLink(links, 'a', 'b', 2_500)
+
+  return buildGraph(
+    [rowOf('a', { name: 'lead' }), rowOf('b', { parentId: 'a' }), rowOf('c', { isLive: false, endedAt: 5 })],
+    links,
+    'claude-opus-5-5',
+    now,
+  )
+}
+
+test('map: drawGraph draws one circle group per node and one path per message edge', () => {
+  const g = mapGraph(3_000)
+  const svg = drawGraph(g, DESKTOP, 410)
+  expect(svg).toStartWith('<svg xmlns="http://www.w3.org/2000/svg" width="410" height="342" viewBox="0 0 360 300">')
+  expect((svg.match(/data-node="/g) ?? []).length).toBe(3)
+  expect((svg.match(/data-edge="message"/g) ?? []).length).toBe(2)
+  expect((svg.match(/data-edge="spawn"/g) ?? []).length).toBe(2)
+  // A message in the last 3 s flies a pulse; the root says MAIN and its model.
+  expect(svg).toContain('<animateMotion')
+  expect(svg).toContain('>MAIN</text>')
+  expect(svg).toContain('>Opus 5.5</text>')
+  expect(drawGraph(mapGraph(60_000), DESKTOP, 410)).not.toContain('<animateMotion')
+
+  // The terminal: the spawn tree, then the message pairs.
+  expect(treeLines(g)).toEqual([
+    'MAIN · Opus 5.5',
+    '└─ lead · running',
+    '   └─ Explore · running',
+    'lead → Explore ×1',
+    'MAIN → lead ×2',
+  ])
+})
+
+test('map: drawGraph is identical for the same graph a second later', () => {
+  // No fresh links: nothing time-derived may reach the source, so the desktop never redraws the image.
+  expect(drawGraph(mapGraph(10_000), DESKTOP, 410)).toBe(drawGraph(mapGraph(11_000), DESKTOP, 410))
+  expect(drawGraph(mapGraph(10_000), DESKTOP, 410)).toContain('begin="0s" repeatCount="indefinite"')
+  expect(drawGraph(mapGraph(10_000), DESKTOP, 410)).not.toMatch(/begin="-/)
+})
+
+test('map: drawGraph escapes labels', () => {
+  const svg = drawGraph(buildGraph([rowOf('<id>', { name: '<b>&"q' })], {}, null, 0), DESKTOP, 360)
+  expect(svg).toContain('&lt;b&gt;&amp;&quot;q')
+  expect(svg).toContain('data-node="&lt;id&gt;"')
+  expect(svg).not.toContain('<b>')
+})
+
+test('layout: root is centred and every node is inside the box', () => {
+  const rows = [
+    ...Array.from({ length: 8 }, (_, i) => rowOf(`a${i}`)),
+    ...Array.from({ length: 8 }, (_, i) => rowOf(`b${i}`, { parentId: `a${i % 3}` })),
+    ...Array.from({ length: 6 }, (_, i) => rowOf(`c${i}`, { parentId: `b${i}` })),
+    rowOf('d0', { parentId: 'c0' }),
+  ]
+  const g = buildGraph(rows, {}, null, 0)
+  const spots = layout(g, 360, 300)
+  expect(spots).toHaveLength(g.nodes.length)
+  expect(spots[0]).toEqual({ id: 'main', x: 180, y: 150 })
+  for (const spot of spots) {
+    expect(spot.x - 13).toBeGreaterThanOrEqual(0)
+    expect(spot.x + 13).toBeLessThanOrEqual(360)
+    expect(spot.y - 13).toBeGreaterThanOrEqual(0)
+    expect(spot.y + 13).toBeLessThanOrEqual(300)
+  }
+  // The first slice starts at the top and runs clockwise.
+  expect(spots[1]?.x ?? 0).toBeGreaterThan(180)
+  // Same input, same picture.
+  expect(layout(g, 360, 300)).toEqual(spots)
+})
+
+test('collapsed: a stored pair without map restores with map open', async ($, on) => {
+  mock.store(on, { collapsed: { live: false, finished: true } })
+  engine(on, { list: MIXED, isPaneUp: false })
+  await $.agent.spawn(SPAWN)
+  await $.session.start({ cwd: 'C:/proj', surface: 'terminal', isInteractive: true })
+
+  for (const surface of SURFACES) {
+    const ui = await $.ui.mount({ ...PANE, surface })
+    expect((await ui.find({ key: 'toggle-map' }))?.text).toContain('▾ MAP')
+    expect(await ui.find({ key: 'map-body' })).toBeDefined()
+    expect((await ui.find({ key: 'finished-label' }))?.text).toContain('▸ FINISHED · 2')
+    expect(await ui.find({ key: 'finished-list' })).toBeUndefined()
+    if (surface === 'desktop') {
+      expect((await ui.findAll({ type: 'Svg' })).some(one => one.props.alt === 'Agent map')).toBe(true)
+    }
+    await ui.press({ key: 'toggle-map' })
+    expect((await ui.find({ key: 'toggle-map' }))?.text).toContain('▸ MAP')
+    expect(await ui.find({ key: 'map-body' })).toBeUndefined()
+    await ui.press({ key: 'toggle-map' })
+    await ui.unmount()
+  }
+})
+
+test('session.send: a delivered message from a subagent to a named agent adds a link', async ($, on) => {
+  const helper: AgentInfo = { ...running, id: 'a2', description: 'help out', name: 'helper', parentId: 'a1' }
+  const clock = engine(on, { list: [running, helper], isPaneUp: true })
+  let isDelivered = true
+  on('session.send', () => (isDelivered ? { isDelivered: true as const } : { isDelivered: false as const, reason: 'gone' }))
+  await $.agent.spawn({ ...SPAWN, name: 'scout' })
+  // The ticker fills the helper's name and parent from the list.
+  await clock.advance(1_000)
+
+  const sent = await $.session.send({ to: 'scout', text: 'secret plan', origin: { kind: 'model' }, agentId: 'a2' })
+  expect(sent.isDelivered).toBe(true)
+  // Refused: no link. To nobody known: no link.
+  isDelivered = false
+  await $.session.send({ to: 'scout', text: 'again', origin: { kind: 'model' }, agentId: 'a2' })
+  isDelivered = true
+  await $.session.send({ to: 'nobody', text: 'hi', origin: { kind: 'model' } })
+
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  expect((await ui.find({ key: 'map-head' }))?.text).toContain('2 running · 1 links')
+  const body = (await ui.find({ key: 'map-body' }))?.text ?? ''
+  expect(body).toContain('└─ scout · running')
+  // The helper hangs from scout, which spawned it.
+  expect(body.indexOf('└─ helper · running')).toBeGreaterThan(body.indexOf('└─ scout · running'))
+  expect(body).toContain('helper → scout ×1')
+  expect(body).not.toContain('secret plan')
+  await ui.unmount()
+})
+
+// ---- What each subagent is doing ---------------------------------------------------------
+
+test('activity: labelFor never returns a command line or a query string', () => {
+  expect(labelFor('Bash', { command: 'curl -H "Authorization: Bearer s3cret" https://x.y/?q=1' })).toBe('curl')
+  expect(labelFor('Bash', { command: 'TOKEN=s3cret git push origin main' })).toBe('git')
+  expect(labelFor('PowerShell', { command: 'Get-Secret -Name db', description: 'Read the db secret name' })).toBe(
+    'Read the db secret name',
+  )
+  expect(labelFor('WebFetch', { url: 'https://user:pw@example.com:8080/a/b?token=s3cret#x', prompt: 'p' })).toBe(
+    'example.com:8080',
+  )
+  expect(labelFor('WebSearch', { query: 'private question' })).toBe('web search')
+  expect(labelFor('Grep', { pattern: 'password=' })).toBe('Grep')
+  expect(labelFor('Read', { file_path: 'C:\\repo\\src\\routes.ts' })).toBe('src/routes.ts')
+  expect(labelFor('Agent', { description: 'map modules', prompt: 'long secret prompt' })).toBe('map modules')
+  expect(labelFor('SendMessage', { to: 'scout', message: 'hi' })).toBe('→ scout')
+  expect(labelFor('Skill', { skill: 'review' })).toBe('review')
+  expect(labelFor('mcp__my_server__do_thing', { arg: 'x' })).toBe('my server: do thing')
+  expect(labelFor('Bash', {})).toBe('Bash')
+  expect(labelFor('Bash', { description: `line\u0007one\nline two ${'x'.repeat(60)}` })).toHaveLength(48)
+  expect(labelFor('Bash', { description: 'a\u0007b\nc' })).toBe('a b c')
+})
+
+test('activity: the list is capped at 40', () => {
+  let list = Array.from({ length: 45 }, (_, i) => i + 1).reduce(
+    (all, id) => pushActivity(all, { id, agentId: 'a1', tool: 'Read', label: 'x', startedAt: id, status: 'run' }),
+    [] as ReturnType<typeof pushActivity>,
+  )
+  expect(list).toHaveLength(ACTIVITY_MAX)
+  expect(list[0]?.id).toBe(6)
+  list = endActivity(list, 45, 'err', 50)
+  expect(list[39]).toMatchObject({ id: 45, status: 'err', endedAt: 50 })
+
+  // The feed: running calls first, then each agent's last finished one; agents off the map left out.
+  const feed = feedRows(
+    [
+      { id: 1, agentId: 'a1', tool: 'Read', label: 'old', startedAt: 0, endedAt: 1_000, status: 'ok' },
+      { id: 2, agentId: 'a1', tool: 'Bash', label: 'npm', startedAt: 2_000, endedAt: 5_000, status: 'err' },
+      { id: 3, agentId: 'a1', tool: 'Grep', label: 'Grep', startedAt: 6_000, status: 'run' },
+      { id: 4, agentId: 'gone', tool: 'Read', label: 'x', startedAt: 6_000, status: 'run' },
+    ],
+    new Map([['a1', 'scout']]),
+    9_000,
+  )
+  expect(feed.map(row => `${row.mark} ${row.agent}  ${row.tool}  ${row.label}  ${row.tail}`)).toEqual([
+    '● scout  Grep  Grep  running',
+    '✕ scout  Bash  npm  3s',
+  ])
+})
+
+test('activity: a subagent tool call shows as running then with its duration', async ($, on) => {
+  const clock = engine(on, { list: [running], isPaneUp: true })
+  let release = () => {}
+  const gate = new Promise<void>(resolve => {
+    release = () => resolve()
+  })
+  let enter = () => {}
+  const entered = new Promise<void>(resolve => {
+    enter = () => resolve()
+  })
+  on('tool.call', async () => {
+    enter()
+    await gate
+
+    return { result: 'ok', text: 'ok' }
+  })
+  await $.agent.spawn(SPAWN)
+
+  // Built apart from the call: `agentId` is the engine's, beside the tool's own arguments.
+  const input = { tool: 'Bash' as const, command: 'curl -H "Authorization: s3cret" https://x.y', agentId: 'a1' }
+  const call = $.tool.call(input)
+  await entered
+  const term = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  const during = (await term.find({ key: 'map-feed' }))?.text ?? ''
+  expect(during).toMatch(/Bash\s+curl\s+running/)
+  expect(during).not.toContain('s3cret')
+  await term.unmount()
+
+  await clock.advance(2_000)
+  release()
+  await call
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  // The feed is Text under the map, not part of its SVG.
+  expect((await ui.find({ key: 'map-feed' }))?.text).toMatch(/Bash\s+curl\s+2s/)
+  const map = (await ui.findAll({ type: 'Svg' })).find(one => one.props.alt === 'Agent map')
+  expect(String(map?.props.source)).not.toContain('curl')
+  await ui.unmount()
+})
+
+test('activity: a main-loop tool call is not recorded', async ($, on) => {
+  engine(on, { list: [running], isPaneUp: true })
+  on('tool.call', () => ({ result: 'ok', text: 'ok' }))
+  await $.agent.spawn(SPAWN)
+  await $.tool.call({ tool: 'Read', file_path: 'C:/repo/src/a.ts' })
+
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  expect(await ui.find({ key: 'map-body' })).toBeDefined()
+  expect(await ui.find({ key: 'map-feed' })).toBeUndefined()
+  await ui.unmount()
 })

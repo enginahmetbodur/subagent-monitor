@@ -25,6 +25,10 @@ export type SubagentMonitorAgent = {
   workflowRunId?: string
   /** True once seen spawned or listed: a subagent, not an engine fork (compaction, memory). */
   isSubagent?: boolean
+  /** The id of the loop that spawned it (`agent.spawn`'s `parentAgentId`); absent = the main loop. */
+  parentId?: string
+  /** What SendMessage addresses it by (`Agent({ name })`, or the list's `name`). */
+  name?: string
   /** Last time the record changed (a request, a spawn, an end), for pruning and the quiet rule. */
   touchedAt: number
 }
@@ -50,6 +54,30 @@ export type SubagentMonitorView = {
 export type SubagentMonitorCollapsed = {
   live: boolean
   finished: boolean
+  map: boolean
+}
+
+/** Delivered messages from one loop to another; the main loop's id is the literal `'main'`. */
+export type SubagentMonitorLink = {
+  from: string
+  to: string
+  count: number
+  /** When the latest of them was delivered, in `$.clock.now()` ms. */
+  lastAt: number
+}
+
+/** Keyed `${from}>${to}`. Never holds a message's text. */
+export type SubagentMonitorLinks = Record<string, SubagentMonitorLink>
+
+/** One tool call of a subagent, for the feed under the map: a short label, never its input or output. */
+export type SubagentMonitorActivity = {
+  id: number
+  agentId: string
+  tool: string
+  label: string
+  startedAt: number
+  endedAt?: number
+  status: 'run' | 'ok' | 'err' | 'block'
 }
 
 declare module 'claude-code' {
@@ -66,8 +94,12 @@ declare module 'claude-code' {
       /** The model id the main loop's requests name, to give subagents on it the session's window. */
       mainModel: string | null
       view: SubagentMonitorView
-      /** The list's folded sections; both open by default, mirrored to `$.store` under `collapsed`. */
+      /** The list's folded sections; all open by default, mirrored to `$.store` under `collapsed`. */
       collapsed: SubagentMonitorCollapsed
+      /** Who messaged whom (SendMessage, delivered), for the map. */
+      links: SubagentMonitorLinks
+      /** Subagents' recent tool calls, newest last, at most 40. */
+      activity: SubagentMonitorActivity[]
     }
   }
 }
