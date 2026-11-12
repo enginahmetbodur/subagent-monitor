@@ -38,7 +38,7 @@ const PANE = {
 const BAND = {
   plugin: PLUGIN,
   component: 'AbovePrompt' as const,
-  props: { hasSurvey: false, isWorking: false, maxRows: 10, bodyColumns: 100, scroll: SCROLL, view: {} },
+  props: { hasSurvey: false, isCollapsed: false, isWorking: false, maxRows: 10, bodyColumns: 100, scroll: SCROLL, view: {} },
 }
 const HAIKU = 'claude-haiku-4-5-20251001'
 const RUN = {
